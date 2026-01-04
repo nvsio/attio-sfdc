@@ -1,0 +1,47 @@
+# attio-sfdc Configuration Example
+# Copy this file to config.toml and fill in your values
+
+[sync]
+direction = "bidirectional"  # attio_to_salesforce, salesforce_to_attio, bidirectional
+batch_size = 100
+conflict_resolution = "last_write"  # last_write, attio_wins, sf_wins, manual
+
+[attio]
+api_key_env = "ATTIO_API_KEY"
+webhook_secret_env = "ATTIO_WEBHOOK_SECRET"
+
+[salesforce]
+client_id_env = "SALESFORCE_CLIENT_ID"
+client_secret_env = "SALESFORCE_CLIENT_SECRET"
+instance_url_env = "SALESFORCE_INSTANCE_URL"
+
+# Custom object mappings (optional)
+# [[custom_mappings]]
+# attio_object = "projects"
+# salesforce_object = "Project__c"
+#
+# [[custom_mappings.fields]]
+# attio = "project_name"
+# salesforce = "Name"
+#
+# [[custom_mappings.fields]]
+# attio = "budget.value"
+# salesforce = "Budget__c"
+# transform = "currency_to_number"
+
+# Override default field mappings (optional)
+# [mappings.companies_to_accounts]
+# enabled = true
+#
+# [[mappings.companies_to_accounts.fields]]
+# attio = "custom_field"
+# salesforce = "Custom_Field__c"
+
+# Custom stage mapping for Deals → Opportunity
+# [mappings.deals_to_opportunities.stages]
+# "new" = "Prospecting"
+# "qualified" = "Qualification"
+# "proposal" = "Proposal/Price Quote"
+# "negotiation" = "Negotiation/Review"
+# "won" = "Closed Won"
+# "lost" = "Closed Lost"

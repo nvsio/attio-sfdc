@@ -1,0 +1,86 @@
+name = "attio-sfdc"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-12-01"
+
+# Build configuration for Rust WASM
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+# Development settings
+[dev]
+port = 8787
+local_protocol = "http"
+
+# Environment variables (secrets should be set via wrangler secret)
+[vars]
+SYNC_DIRECTION = "bidirectional"
+CONFLICT_RESOLUTION = "last_write"
+BATCH_SIZE = "100"
+LOG_LEVEL = "info"
+
+# KV Namespace for ID mappings and sync cursors
+[[kv_namespaces]]
+binding = "ID_MAPPINGS"
+id = "your-kv-namespace-id"
+preview_id = "your-preview-kv-namespace-id"
+
+[[kv_namespaces]]
+binding = "SYNC_CURSORS"
+id = "your-kv-namespace-id-2"
+preview_id = "your-preview-kv-namespace-id-2"
+
+[[kv_namespaces]]
+binding = "CONFIG_CACHE"
+id = "your-kv-namespace-id-3"
+preview_id = "your-preview-kv-namespace-id-3"
+
+# D1 Database for sync history and audit logs
+[[d1_databases]]
+binding = "SYNC_DB"
+database_name = "attio-sfdc-sync"
+database_id = "your-d1-database-id"
+
+# Durable Objects for distributed locks
+[durable_objects]
+bindings = [
+  { name = "SYNC_LOCK", class_name = "SyncLock" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SyncLock"]
+
+# Queue for async webhook processing
+[[queues.producers]]
+queue = "attio-sfdc-webhooks"
+binding = "WEBHOOK_QUEUE"
+
+[[queues.consumers]]
+queue = "attio-sfdc-webhooks"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "attio-sfdc-webhooks-dlq"
+
+# Cron triggers for scheduled sync
+[triggers]
+crons = [
+  "*/15 * * * *"  # Run incremental sync every 15 minutes
+]
+
+# Production environment
+[env.production]
+name = "attio-sfdc-prod"
+routes = [
+  { pattern = "sync.yourdomain.com/*", zone_name = "yourdomain.com" }
+]
+
+[env.production.vars]
+LOG_LEVEL = "warn"
+
+# Staging environment
+[env.staging]
+name = "attio-sfdc-staging"
+
+[env.staging.vars]
+LOG_LEVEL = "debug"

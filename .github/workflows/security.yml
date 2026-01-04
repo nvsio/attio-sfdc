@@ -1,0 +1,410 @@
+# =============================================================================
+# Security Scanning Workflow - Comprehensive Vulnerability Detection
+# =============================================================================
+# Runs on schedule, PRs, and pushes to detect security vulnerabilities,
+# license compliance issues, and supply chain risks.
+# =============================================================================
+
+name: Security
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "**.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/security.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "**.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/security.yml"
+  schedule:
+    # Run daily at 2 AM UTC to catch newly disclosed vulnerabilities
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      full_scan:
+        description: "Run full security scan including expensive checks"
+        required: false
+        default: "false"
+        type: boolean
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  # ===========================================================================
+  # Cargo Audit - Known Vulnerability Detection
+  # ===========================================================================
+  cargo-audit:
+    name: Vulnerability Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@25a3f4cbf9cb2d7db9106ea9dfa59a176a94ef5a # v2.45.4
+        with:
+          tool: cargo-audit
+
+      - name: Generate audit report
+        run: |
+          cargo audit --json > audit-report.json 2>&1 || true
+          cargo audit --deny warnings 2>&1 | tee audit-output.txt || echo "::warning::Security vulnerabilities detected"
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: security-audit-report
+          path: |
+            audit-report.json
+            audit-output.txt
+          retention-days: 30
+        if: always()
+
+      - name: Create issue on vulnerability detection (scheduled runs)
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('audit-output.txt', 'utf8');
+            const title = `[Security] Vulnerabilities detected in dependencies - ${new Date().toISOString().split('T')[0]}`;
+
+            // Check if similar issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'security,dependencies'
+            });
+
+            const existingIssue = issues.data.find(issue =>
+              issue.title.includes('[Security] Vulnerabilities detected')
+            );
+
+            if (!existingIssue) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: `## Security Vulnerabilities Detected\n\nThe daily security audit found vulnerabilities in project dependencies.\n\n\`\`\`\n${output.slice(0, 3000)}\n\`\`\`\n\n**Action Required:**\n- Review the vulnerabilities above\n- Update affected dependencies\n- If updates are not available, assess risk and document exceptions\n\n---\n*This issue was automatically created by the security workflow.*`,
+                labels: ['security', 'dependencies', 'automated']
+              });
+            }
+
+  # ===========================================================================
+  # Cargo Deny - License and Dependency Policy Enforcement
+  # ===========================================================================
+  cargo-deny:
+    name: Dependency Policy Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Create deny.toml if not exists
+        run: |
+          if [ ! -f deny.toml ]; then
+            cat > deny.toml << 'EOF'
+          # =============================================================================
+          # cargo-deny configuration
+          # =============================================================================
+          # This file configures cargo-deny for license compliance, security, and
+          # dependency management policies.
+          # =============================================================================
+
+          [graph]
+          targets = [
+              "x86_64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin",
+              "wasm32-unknown-unknown",
+          ]
+
+          # =============================================================================
+          # Advisories - Security vulnerability checking
+          # =============================================================================
+          [advisories]
+          db-path = "~/.cargo/advisory-db"
+          db-urls = ["https://github.com/rustsec/advisory-db"]
+          ignore = []
+
+          # =============================================================================
+          # Licenses - Allowed and denied licenses
+          # =============================================================================
+          [licenses]
+          allow = [
+              "MIT",
+              "Apache-2.0",
+              "Apache-2.0 WITH LLVM-exception",
+              "BSD-2-Clause",
+              "BSD-3-Clause",
+              "ISC",
+              "Zlib",
+              "0BSD",
+              "Unicode-3.0",
+              "Unicode-DFS-2016",
+              "CC0-1.0",
+              "MPL-2.0",
+          ]
+          confidence-threshold = 0.93
+          exceptions = []
+
+          [licenses.private]
+          ignore = false
+          registries = []
+
+          # =============================================================================
+          # Bans - Dependency restrictions
+          # =============================================================================
+          [bans]
+          multiple-versions = "warn"
+          wildcards = "deny"
+          highlight = "all"
+          workspace-default-features = "allow"
+          external-default-features = "allow"
+
+          # Crates to deny completely
+          deny = [
+              # Use ring or rustls-based alternatives
+              # { name = "openssl-sys", wrappers = [] },
+          ]
+
+          # Skip specific versions in duplicate detection
+          skip = []
+          skip-tree = []
+
+          # =============================================================================
+          # Sources - Allowed dependency sources
+          # =============================================================================
+          [sources]
+          unknown-registry = "deny"
+          unknown-git = "deny"
+          allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+          allow-git = []
+
+          [sources.allow-org]
+          github = []
+          EOF
+          fi
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@25a3f4cbf9cb2d7db9106ea9dfa59a176a94ef5a # v2.45.4
+        with:
+          tool: cargo-deny
+
+      - name: Check advisories
+        run: cargo deny check advisories
+
+      - name: Check licenses
+        run: cargo deny check licenses
+
+      - name: Check bans
+        run: cargo deny check bans
+
+      - name: Check sources
+        run: cargo deny check sources
+
+      - name: Generate full report
+        run: cargo deny check --show-stats 2>&1 | tee deny-report.txt || true
+
+      - name: Upload deny report
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: cargo-deny-report
+          path: deny-report.txt
+          retention-days: 30
+        if: always()
+
+  # ===========================================================================
+  # SAST - Static Application Security Testing with CodeQL
+  # ===========================================================================
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@48ab28a6f5dbc2a99bf1e0131198dd8f1df78169 # v3.28.0
+        with:
+          languages: rust
+          build-mode: manual
+          queries: security-and-quality
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-codeql-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-codeql-
+            ${{ runner.os }}-cargo-
+
+      - name: Build for CodeQL analysis
+        run: cargo build --release --all-features
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@48ab28a6f5dbc2a99bf1e0131198dd8f1df78169 # v3.28.0
+        with:
+          category: "/language:rust"
+
+  # ===========================================================================
+  # Semgrep - Additional SAST scanning
+  # ===========================================================================
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run Semgrep
+        run: |
+          semgrep ci \
+            --config auto \
+            --config p/rust \
+            --sarif --output=semgrep-results.sarif \
+            || true
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@48ab28a6f5dbc2a99bf1e0131198dd8f1df78169 # v3.28.0
+        with:
+          sarif_file: semgrep-results.sarif
+        if: always()
+
+  # ===========================================================================
+  # Dependency Review - PR-only supply chain security
+  # ===========================================================================
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019 # v4.5.0
+        with:
+          fail-on-severity: high
+          deny-licenses: LGPL-2.0, GPL-2.0, GPL-3.0, AGPL-3.0
+          allow-licenses: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, MPL-2.0, Zlib
+          comment-summary-in-pr: always
+
+  # ===========================================================================
+  # Secrets Scanning - Detect leaked secrets
+  # ===========================================================================
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Detect secrets with Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # Supply Chain Security - SBOM Generation
+  # ===========================================================================
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx
+
+      - name: Generate CycloneDX SBOM
+        run: cargo cyclonedx --format json --output sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: sbom
+          path: sbom.json
+          retention-days: 90
+
+  # ===========================================================================
+  # Security Status - Aggregate results
+  # ===========================================================================
+  security-status:
+    name: Security Status
+    runs-on: ubuntu-latest
+    needs: [cargo-audit, cargo-deny, codeql, semgrep, secrets-scan]
+    if: always()
+    steps:
+      - name: Check security scan results
+        run: |
+          if [[ "${{ needs.cargo-audit.result }}" == "failure" ]]; then
+            echo "::error::Cargo audit detected vulnerabilities"
+          fi
+          if [[ "${{ needs.cargo-deny.result }}" == "failure" ]]; then
+            echo "::error::Cargo deny policy check failed"
+          fi
+          if [[ "${{ needs.secrets-scan.result }}" == "failure" ]]; then
+            echo "::error::Secrets detected in repository"
+            exit 1
+          fi
+
+          # Allow continuing with warnings for audit/deny but fail on secrets
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "::warning::Some security checks reported issues. Review the individual job outputs."
+          fi
+          echo "Security scan completed"
+
+      - name: Post summary
+        run: |
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cargo Audit | ${{ needs.cargo-audit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cargo Deny | ${{ needs.cargo-deny.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CodeQL | ${{ needs.codeql.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Semgrep | ${{ needs.semgrep.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets Scan | ${{ needs.secrets-scan.result }} |" >> $GITHUB_STEP_SUMMARY

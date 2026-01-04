@@ -1,0 +1,34 @@
+# Rust
+/target/
+Cargo.lock
+
+# Cloudflare Workers
+/build/
+.wrangler/
+.dev.vars
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Test outputs
+*.log
+coverage/
+
+# Secrets (never commit)
+secrets/
+*.pem
+*.key
+credentials.json
