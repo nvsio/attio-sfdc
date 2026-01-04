@@ -19,8 +19,8 @@ DANGEROUS_PATTERNS=(
     "> /dev/sd"
     "dd if=/dev/zero"
     "chmod -R 777 /"
-    "curl.*|.*bash"     # Piping curl to bash
-    "wget.*|.*sh"       # Piping wget to shell
+    "curl.*\|.*bash"    # Piping curl to bash
+    "wget.*\|.*sh"      # Piping wget to shell
 )
 
 # Check for dangerous patterns
