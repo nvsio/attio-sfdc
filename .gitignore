@@ -32,3 +32,6 @@ secrets/
 *.pem
 *.key
 credentials.json
+
+# Claude instructions (private)
+CLAUDE.md
