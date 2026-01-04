@@ -1,3 +1,5 @@
+![attio-sfdc.png](/static/attio-sfdc.png)
+
 # attio-sfdc
 
 A high-performance Rust bridge for bidirectional sync between Attio CRM and Salesforce.
