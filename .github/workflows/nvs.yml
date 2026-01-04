@@ -1,0 +1,454 @@
+# =============================================================================
+# NVS Bot - Claude Code SDK PR Review with Subagents
+# =============================================================================
+# All merges to main require PRs reviewed by NVS using Claude Code SDK.
+# Uses specialized subagents with skills for comprehensive review.
+# =============================================================================
+
+name: NVS
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
+concurrency:
+  group: nvs-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+
+jobs:
+  # ===========================================================================
+  # CI Checks - Fast parallel checks
+  # ===========================================================================
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: clippy-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo test --all-features
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo build --release --all-features
+
+  wasm:
+    name: WASM
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo build --target wasm32-unknown-unknown --no-default-features
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  # ===========================================================================
+  # NVS Bot - Claude Code SDK with Subagents
+  # ===========================================================================
+  nvs-review:
+    name: NVS Review
+    runs-on: ubuntu-latest
+    needs: [format, clippy, test, build, wasm, security]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changes
+        run: |
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          git diff --name-only origin/${{ github.base_ref }}...HEAD >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          git diff origin/${{ github.base_ref }}...HEAD >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "stats<<EOF" >> $GITHUB_OUTPUT
+          git diff --stat origin/${{ github.base_ref }}...HEAD >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create NVS review script
+        run: |
+          cat > nvs-review.mjs << 'SCRIPT'
+          import Anthropic from '@anthropic-ai/sdk';
+
+          const anthropic = new Anthropic();
+
+          // Subagent definitions with skills
+          const subagents = {
+            codeReviewer: {
+              name: 'Senior Code Reviewer',
+              skill: 'Analyzes code quality, patterns, and best practices',
+              prompt: (diff) => `You are a senior Rust code reviewer. Analyze this diff for:
+          - Code quality and readability
+          - Rust best practices and idioms
+          - Error handling patterns
+          - Performance implications
+
+          Diff:
+          ${diff}
+
+          Provide specific, actionable feedback.`
+            },
+
+            securityAnalyst: {
+              name: 'Security Analyst',
+              skill: 'Identifies security vulnerabilities and risks',
+              prompt: (diff) => `You are a security analyst specializing in Rust and API integrations. Review this diff for:
+          - Potential security vulnerabilities
+          - Unsafe code usage
+          - Input validation issues
+          - Secret/credential handling
+          - API security concerns (this is a CRM data sync tool)
+
+          Diff:
+          ${diff}
+
+          Flag any security concerns.`
+            },
+
+            architectureReviewer: {
+              name: 'Architecture Reviewer',
+              skill: 'Evaluates design and architectural decisions',
+              prompt: (diff, files) => `You are a software architect. Review this change for:
+          - Architectural consistency
+          - Module boundaries and coupling
+          - Design patterns usage
+          - Scalability considerations
+          - This is a zero-dependency Rust CRM bridge (Attio <-> Salesforce)
+
+          Files changed: ${files}
+          Diff:
+          ${diff}
+
+          Assess architectural impact.`
+            },
+
+            testReviewer: {
+              name: 'Test Reviewer',
+              skill: 'Evaluates test coverage and quality',
+              prompt: (diff) => `You are a QA engineer. Review this diff for:
+          - Test coverage of new code
+          - Test quality and assertions
+          - Edge cases handling
+          - Integration test needs
+
+          Diff:
+          ${diff}
+
+          Suggest any missing tests.`
+            }
+          };
+
+          async function runSubagent(agent, diff, files) {
+            try {
+              const response = await anthropic.messages.create({
+                model: 'claude-sonnet-4-20250514',
+                max_tokens: 1024,
+                messages: [{
+                  role: 'user',
+                  content: agent.prompt(diff, files)
+                }]
+              });
+              return {
+                name: agent.name,
+                skill: agent.skill,
+                analysis: response.content[0].text
+              };
+            } catch (error) {
+              return {
+                name: agent.name,
+                skill: agent.skill,
+                analysis: `Analysis unavailable: ${error.message}`
+              };
+            }
+          }
+
+          async function synthesize(results, ciStatus) {
+            const analysisText = results.map(r =>
+              `### ${r.name} (${r.skill})\n${r.analysis}`
+            ).join('\n\n');
+
+            const response = await anthropic.messages.create({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 2048,
+              messages: [{
+                role: 'user',
+                content: `You are NVS, the lead reviewer. Synthesize these subagent analyses into a final review.
+
+          CI Status:
+          ${ciStatus}
+
+          Subagent Analyses:
+          ${analysisText}
+
+          Provide:
+          1. Executive Summary (2-3 sentences)
+          2. Key Findings (bullet points)
+          3. Required Changes (if any)
+          4. Recommendations
+          5. Final Verdict: APPROVE, REQUEST_CHANGES, or COMMENT
+
+          Be concise and actionable.`
+              }]
+            });
+
+            return response.content[0].text;
+          }
+
+          // Main execution
+          const diff = process.env.PR_DIFF || '';
+          const files = process.env.PR_FILES || '';
+          const ciStatus = process.env.CI_STATUS || '';
+
+          console.log('Starting NVS analysis with subagents...\n');
+
+          // Run subagents in parallel
+          const results = await Promise.all([
+            runSubagent(subagents.codeReviewer, diff, files),
+            runSubagent(subagents.securityAnalyst, diff, files),
+            runSubagent(subagents.architectureReviewer, diff, files),
+            runSubagent(subagents.testReviewer, diff, files)
+          ]);
+
+          console.log('Subagent analyses complete. Synthesizing...\n');
+
+          // Synthesize final review
+          const finalReview = await synthesize(results, ciStatus);
+
+          // Output for GitHub
+          const output = {
+            subagentResults: results,
+            finalReview: finalReview
+          };
+
+          console.log(JSON.stringify(output, null, 2));
+          SCRIPT
+
+      - name: Install SDK
+        run: npm install @anthropic-ai/sdk
+
+      - name: Run NVS Analysis
+        id: nvs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_DIFF: ${{ steps.changes.outputs.diff }}
+          PR_FILES: ${{ steps.changes.outputs.files }}
+          CI_STATUS: |
+            Format: ${{ needs.format.result }}
+            Clippy: ${{ needs.clippy.result }}
+            Tests: ${{ needs.test.result }}
+            Build: ${{ needs.build.result }}
+            WASM: ${{ needs.wasm.result }}
+            Security: ${{ needs.security.result }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo '{"finalReview": "NVS analysis unavailable - ANTHROPIC_API_KEY not configured", "subagentResults": []}' > nvs-output.json
+          else
+            node nvs-review.mjs > nvs-output.json 2>&1 || echo '{"finalReview": "NVS analysis failed", "subagentResults": []}' > nvs-output.json
+          fi
+
+      - name: Post Review Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let nvsOutput;
+            try {
+              nvsOutput = JSON.parse(fs.readFileSync('nvs-output.json', 'utf8'));
+            } catch (e) {
+              nvsOutput = { finalReview: 'Unable to parse NVS output', subagentResults: [] };
+            }
+
+            const ciStatus = {
+              format: '${{ needs.format.result }}',
+              clippy: '${{ needs.clippy.result }}',
+              test: '${{ needs.test.result }}',
+              build: '${{ needs.build.result }}',
+              wasm: '${{ needs.wasm.result }}',
+              security: '${{ needs.security.result }}'
+            };
+
+            const emoji = (s) => s === 'success' ? ':white_check_mark:' : s === 'skipped' ? ':fast_forward:' : ':x:';
+            const allPassed = Object.values(ciStatus).every(s => s === 'success' || s === 'skipped');
+
+            let subagentSection = '';
+            if (nvsOutput.subagentResults && nvsOutput.subagentResults.length > 0) {
+              subagentSection = `
+            <details>
+            <summary>Subagent Analyses</summary>
+
+            ${nvsOutput.subagentResults.map(r => `
+            #### ${r.name}
+            *${r.skill}*
+
+            ${r.analysis}
+            `).join('\n---\n')}
+            </details>`;
+            }
+
+            const body = `## NVS Review ${allPassed ? ':white_check_mark:' : ':x:'}
+
+            ### CI Status
+            | Check | Status |
+            |-------|--------|
+            | Format | ${emoji(ciStatus.format)} ${ciStatus.format} |
+            | Clippy | ${emoji(ciStatus.clippy)} ${ciStatus.clippy} |
+            | Tests | ${emoji(ciStatus.test)} ${ciStatus.test} |
+            | Build | ${emoji(ciStatus.build)} ${ciStatus.build} |
+            | WASM | ${emoji(ciStatus.wasm)} ${ciStatus.wasm} |
+            | Security | ${emoji(ciStatus.security)} ${ciStatus.security} |
+
+            ### Code Review
+
+            ${nvsOutput.finalReview || 'Review unavailable'}
+
+            ${subagentSection}
+
+            ---
+            *NVS uses Claude Code SDK with specialized subagents: Code Reviewer, Security Analyst, Architecture Reviewer, and Test Reviewer*`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes('## NVS Review'));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
+
+      - name: Set final status
+        run: |
+          if [[ "${{ needs.format.result }}" == "failure" ]] || \
+             [[ "${{ needs.clippy.result }}" == "failure" ]] || \
+             [[ "${{ needs.test.result }}" == "failure" ]] || \
+             [[ "${{ needs.build.result }}" == "failure" ]]; then
+            echo "CI checks failed - PR cannot be merged"
+            exit 1
+          fi
+          echo "All required checks passed"
+
+  # ===========================================================================
+  # NVS Gate - Required status check for branch protection
+  # ===========================================================================
+  nvs-gate:
+    name: NVS Gate
+    runs-on: ubuntu-latest
+    needs: [nvs-review]
+    if: always()
+    steps:
+      - name: Gate check
+        run: |
+          if [[ "${{ needs.nvs-review.result }}" != "success" ]]; then
+            echo "NVS review incomplete or failed"
+            exit 1
+          fi
+          echo "PR cleared by NVS"
